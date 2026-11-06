@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SplitRoute</RootNamespace>
+    <AssemblyName>SplitRoute</AssemblyName>
+    <ApplicationIcon>SplitRoute.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <!-- 工具是複製 exe 散佈的，別人手上是哪一版只能靠版本號問出來。
+         改版請動這裡，標題列與「關於」會跟著變。 -->
+    <Version>1.1.0</Version>
+    <Product>SplitRoute</Product>
+    <AssemblyTitle>SplitRoute — 內外網雙網卡分流路由管理</AssemblyTitle>
+
+    <!-- 自封裝單一 exe：收到這支工具的人不見得裝過 .NET 10 Desktop Runtime，
+         而這是個「丟一個檔案過去就要能跑」的小工具，不能要求對方先裝執行環境。
+         代價是 exe 約 70MB（已開壓縮）。 -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+
+    <!-- WinForms 大量依賴反射，trim 掉會在執行期才爆，不值得為了體積冒這個險 -->
+    <PublishTrimmed>false</PublishTrimmed>
+    <SatelliteResourceLanguages>en;zh-Hant</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- exe 圖示由 ApplicationIcon 決定；另外嵌進來給視窗標題列與系統匣用 -->
+    <EmbeddedResource Include="SplitRoute.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 說明檔跟著 exe 一起產出，「說明 → 使用說明」是去 exe 旁邊找它 -->
+    <None Update="使用說明.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
