@@ -27,14 +27,31 @@ internal enum NrptState
     NotLocal,
     /// <summary>兩邊都有，但 DNS 伺服器不一樣 —— 改過設定、服務還沒重新載入。</summary>
     Mismatch,
+    /// <summary>系統裡有規則，設定清單裡卻沒有 —— 套用過又從清單刪掉，或是別的工具加的。</summary>
+    NotInSettings,
+    /// <summary>清單裡有，系統裡沒有 —— 還沒套用，或已經清除路由。</summary>
+    NotApplied,
 }
 
-internal sealed record NrptEntry(string Namespace, List<string> Configured, List<string> Effective, NrptState State);
+/// <param name="Marked">系統裡的規則帶 SplitRoute 的標記，下次套用／清除時會自動處理。</param>
+internal sealed record NrptEntry(
+    string Namespace, List<string> Configured, List<string> Effective, NrptState State, bool Marked);
 
 internal sealed record NrptStatus(List<NrptEntry> Entries, List<string> Errors);
 
 internal static class RouteEngine
 {
+    /// <summary>
+    /// 我們加的 NRPT 規則都在 Comment 寫這個標記。
+    ///
+    /// 套用和清除原本只處理「設定清單上現在有的」domain，於是一個 domain 套用過之後
+    /// 再從清單刪掉，它的規則就永遠留在系統裡，連「清除路由」都清不掉 —— 那個 domain
+    /// 的查詢會一直被導到內網 DNS，而畫面上的清單完全看不出來。有了標記，就能認出
+    /// 「是我們加的、但清單已經不要了」的規則，又不會誤刪別的工具或群組原則加的。
+    /// 加標記之前建的舊規則認不出來，只會在「檢視 NRPT 規則」列出來讓使用者自己決定。
+    /// </summary>
+    public const string NrptMarker = "SplitRoute";
+
     // ------------------------------------------------------------------
     // 介面資訊更新
     // ------------------------------------------------------------------
@@ -148,6 +165,7 @@ internal static class RouteEngine
         {
             interfaceIndex = cfg.InternalInterface!.Index,
             dnsServers = cfg.InternalDnsServers,
+            marker = NrptMarker,
             domains = domains.Select(d => new
             {
                 ns = NetInfo.NormalizeNamespace(d.Namespace),
@@ -189,6 +207,19 @@ internal static class RouteEngine
               }
             }
 
+            # 從清單刪掉的 domain：只動帶我們標記的規則，別的工具或手動加的不碰
+            $wanted = @($plan.domains | ForEach-Object { $_.ns })
+            foreach ($rule in @(Get-DnsClientNrptRule | Where-Object { $_.Comment -eq $plan.marker })) {
+              $stale = @($rule.Namespace | Where-Object { $wanted -notcontains $_ })
+              if ($stale.Count -eq 0) { continue }
+              try {
+                $rule | Remove-DnsClientNrptRule -Force
+                Write-Output "OK|[NRPT] 移除已不在清單的 $($stale -join ', ')"
+              } catch {
+                Write-Output "ERR|[NRPT] 移除 $($stale -join ', ') 失敗: $($_.Exception.Message)"
+              }
+            }
+
             foreach ($d in @($plan.domains)) {
               $servers = [string[]]@($d.servers)
               try {
@@ -196,7 +227,7 @@ internal static class RouteEngine
                 Get-DnsClientNrptRule |
                   Where-Object { $_.Namespace -eq $d.ns } |
                   Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue
-                Add-DnsClientNrptRule -Namespace $d.ns -NameServers $servers
+                Add-DnsClientNrptRule -Namespace $d.ns -NameServers $servers -Comment $plan.marker
                 Write-Output "OK|[NRPT] $($d.ns) -> $($servers -join ', ')"
               } catch {
                 Write-Output "ERR|[NRPT] $($d.ns) 失敗: $($_.Exception.Message)"
@@ -294,6 +325,7 @@ internal static class RouteEngine
             restoreDefaultRoute = cfg.InternalInterface != null,
             resetDns,
             namespaces,
+            marker = NrptMarker,
         });
 
         const string script = """
@@ -352,6 +384,18 @@ internal static class RouteEngine
               }
             }
 
+            # 清單上沒有、但帶我們標記的規則（之前套用過，後來才從清單刪掉）
+            foreach ($rule in @(Get-DnsClientNrptRule | Where-Object { $_.Comment -eq $plan.marker })) {
+              $other = @($rule.Namespace | Where-Object { @($plan.namespaces) -notcontains $_ })
+              if ($other.Count -eq 0) { continue }   # 下面照清單移除時會處理到
+              try {
+                $rule | Remove-DnsClientNrptRule -Force
+                Write-Output "OK|[NRPT] 移除已不在清單的 $($other -join ', ')"
+              } catch {
+                Write-Output "ERR|[NRPT] 移除 $($other -join ', ') 失敗: $($_.Exception.Message)"
+              }
+            }
+
             foreach ($ns in @($plan.namespaces)) {
               try {
                 $hit = @(Get-DnsClientNrptRule | Where-Object { $_.Namespace -eq $ns })
@@ -387,15 +431,20 @@ internal static class RouteEngine
     /// 規則一加就進登錄檔，但服務是自己找時機重新載入的，中間會有落差；
     /// 另外只要群組原則下發了任何 NRPT，本機規則會整組被忽略。只看前者的話，
     /// 「設了卻沒生效」這件事在畫面上完全看不出來 —— 而那正是使用者打開這個畫面要查的。
+    ///
+    /// 第三層是設定清單本身：系統裡有、清單裡沒有的規則（套用過又從清單刪掉、或別人加的）
+    /// 會讓那個 domain 一直走內網 DNS，而清單看起來一切正常，所以也要比。
     /// </summary>
-    public static async Task<NrptStatus> NrptStatusAsync(CancellationToken ct = default)
+    public static async Task<NrptStatus> NrptStatusAsync(Settings cfg, CancellationToken ct = default)
     {
+        // 每行 "種類|是否帶我們的標記|namespace|DNS 伺服器"
         const string script = """
             [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
             try {
               Get-DnsClientNrptRule -ErrorAction Stop | ForEach-Object {
+                $mine = if ($_.Comment -eq $env:SR_MARKER) { '1' } else { '0' }
                 $servers = @($_.NameServers) -join ','
-                foreach ($ns in @($_.Namespace)) { Write-Output "RULE|$ns|$servers" }
+                foreach ($ns in @($_.Namespace)) { Write-Output "RULE|$mine|$ns|$servers" }
               }
             } catch {
               Write-Output "ERR|讀取已設定的 NRPT 規則失敗: $($_.Exception.Message)"
@@ -403,60 +452,72 @@ internal static class RouteEngine
             try {
               Get-DnsClientNrptPolicy -ErrorAction Stop | ForEach-Object {
                 $servers = @($_.NameServers) -join ','
-                foreach ($ns in @($_.Namespace)) { Write-Output "POLICY|$ns|$servers" }
+                foreach ($ns in @($_.Namespace)) { Write-Output "POLICY|0|$ns|$servers" }
               }
             } catch {
               Write-Output "ERR|讀取生效中的 NRPT 原則失敗: $($_.Exception.Message)"
             }
             """;
 
-        ExecResult r = await ProcessRunner.PowerShellAsync(script, null, ct).ConfigureAwait(false);
+        ExecResult r = await ProcessRunner.PowerShellAsync(
+            script, new Dictionary<string, string> { ["SR_MARKER"] = NrptMarker }, ct).ConfigureAwait(false);
 
         var configured = new Dictionary<string, SortedSet<string>>(StringComparer.OrdinalIgnoreCase);
         var effective = new Dictionary<string, SortedSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var marked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var errors = new List<string>();
 
         foreach (string line in SplitLines(r.Output))
         {
-            string[] parts = line.Split('|', 3);
+            if (line.StartsWith("ERR|", StringComparison.Ordinal)) { errors.Add(line[4..]); continue; }
+
+            string[] parts = line.Split('|', 4);
             Dictionary<string, SortedSet<string>>? target = parts[0] switch
             {
                 "RULE" => configured,
                 "POLICY" => effective,
                 _ => null,
             };
-
-            if (parts[0] == "ERR" && parts.Length > 1) { errors.Add(line[4..]); continue; }
-            if (target == null || parts.Length < 3 || parts[1].Length == 0)
+            if (target == null || parts.Length < 4 || parts[2].Length == 0)
             {
                 if (!r.Ok) errors.Add(line);
                 continue;
             }
 
-            if (!target.TryGetValue(parts[1], out SortedSet<string>? set))
-                target[parts[1]] = set = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string s in parts[2].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            string ns = parts[2];
+            if (parts[0] == "RULE" && parts[1] == "1") marked.Add(ns);
+            if (!target.TryGetValue(ns, out SortedSet<string>? set))
+                target[ns] = set = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string s in parts[3].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                 set.Add(s);
         }
 
         if (!r.Ok && errors.Count == 0)
             errors.Add(string.IsNullOrWhiteSpace(r.Output) ? "PowerShell 執行失敗" : r.Output.Trim());
 
+        var inSettings = new HashSet<string>(
+            cfg.InternalDomains.Select(d => NetInfo.NormalizeNamespace(d.Namespace)).Where(s => s.Length > 0),
+            StringComparer.OrdinalIgnoreCase);
+
         var entries = configured.Keys
             .Union(effective.Keys, StringComparer.OrdinalIgnoreCase)
+            .Union(inSettings, StringComparer.OrdinalIgnoreCase)
             .OrderBy(ns => ns.TrimStart('.'), StringComparer.OrdinalIgnoreCase)
             .Select(ns =>
             {
                 configured.TryGetValue(ns, out SortedSet<string>? c);
                 effective.TryGetValue(ns, out SortedSet<string>? e);
+                bool listed = inSettings.Contains(ns);
                 NrptState state = (c, e) switch
                 {
+                    (not null, _) when !listed => NrptState.NotInSettings,
+                    (null, null) => NrptState.NotApplied,
                     (not null, null) => NrptState.NotLoaded,
                     (null, not null) => NrptState.NotLocal,
                     _ when c!.SetEquals(e!) => NrptState.Effective,
                     _ => NrptState.Mismatch,
                 };
-                return new NrptEntry(ns, c?.ToList() ?? [], e?.ToList() ?? [], state);
+                return new NrptEntry(ns, c?.ToList() ?? [], e?.ToList() ?? [], state, marked.Contains(ns));
             })
             .ToList();
 

@@ -889,9 +889,14 @@ internal sealed class MainForm : Form
         if (_lvDomains.SelectedIndices.Count == 0) return;
         int i = _lvDomains.SelectedIndices[0];
         if (i < 0 || i >= _cfg.InternalDomains.Count) return;
+        string ns = NetInfo.NormalizeNamespace(_cfg.InternalDomains[i].Namespace);
         _cfg.InternalDomains.RemoveAt(i);
         _cfg.Save();
         RenderDomains();
+
+        // 這裡只改設定，系統裡的規則要等下次套用才會移除；不講的話看起來像是刪了沒反應
+        if (_cfg.Applied)
+            LogLine($"已從清單移除 {ns}，系統裡的 NRPT 規則會在下次「套用路由」時一起移除", InfoColor);
     }
 
     // ==================================================================
@@ -1069,7 +1074,7 @@ internal sealed class MainForm : Form
         SetStatus("讀取 NRPT 規則…");
         LogLine("───── NRPT 規則（已設定 vs 生效中）─────", InfoColor);
 
-        NrptStatus status = await RouteEngine.NrptStatusAsync();
+        NrptStatus status = await RouteEngine.NrptStatusAsync(_cfg);
         foreach (string err in status.Errors)
             LogLine($"  ✗ {err}", ErrColor);
 
@@ -1094,7 +1099,31 @@ internal sealed class MainForm : Form
                 case NrptState.Mismatch:
                     LogLine($"  ⚠ {e.Namespace}　已設定 {Join(e.Configured)}，生效中卻是 {Join(e.Effective)}", WarnColor);
                     break;
+                case NrptState.NotInSettings when e.Marked:
+                    LogLine($"  ⚠ {e.Namespace} -> {Join(e.Configured)}　不在設定清單裡，下次套用或清除路由時會移除", WarnColor);
+                    break;
+                case NrptState.NotInSettings:
+                    LogLine($"  ⚠ {e.Namespace} -> {Join(e.Configured)}　不在設定清單裡，也不是 SplitRoute 標記過的規則", WarnColor);
+                    break;
+                case NrptState.NotApplied:
+                    LogLine($"  · {e.Namespace} -> （無）　在設定清單裡，系統還沒有（尚未套用）", InfoColor);
+                    break;
             }
+        }
+
+        // 沒標記的規則可能是舊版 SplitRoute／MyRoute 加的，也可能是別的工具或 VPN 加的，
+        // 程式分不出來，所以不自動刪，只告訴使用者怎麼刪。
+        List<string> foreign = status.Entries
+            .Where(e => e.State == NrptState.NotInSettings && !e.Marked)
+            .Select(e => e.Namespace)
+            .ToList();
+        if (foreign.Count > 0)
+        {
+            LogLine("  上面沒有標記的規則，可能是舊版 SplitRoute 加的，也可能是別的工具或 VPN 加的，程式不會自動刪。"
+                  + "確定不要的話，以系統管理員身分在 PowerShell 執行：", InfoColor);
+            foreach (string ns in foreign)
+                LogLine($"    Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -contains '{ns}' }} | Remove-DnsClientNrptRule -Force",
+                        Color.Black);
         }
 
         if (status.Entries.Any(e => e.State is NrptState.NotLoaded or NrptState.Mismatch))

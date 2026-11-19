@@ -113,6 +113,13 @@ dotnet publish -c Release    # 產出單一自封裝 exe，約 47MB
 * **USB 網路共用／DHCP 每次重連給的閘道都不一樣**，設定檔存的值過夜就過期，
   所以每次套用前都要先 `RefreshInterfaces`。
 
+* **我們加的 NRPT 規則 `Comment` 一律寫 `SplitRoute`（`RouteEngine.NrptMarker`）。**
+  只照「清單上現在有的」domain 加／刪的話，套用過再從清單刪掉的 domain 會永遠留在系統裡，
+  連「清除路由」都清不掉，那個 domain 一直被導去內網 DNS，清單上卻看不出來。
+  所以套用時移除「有標記、但不在清單」的規則，清除時移除所有有標記的規則。
+  **沒標記的規則一律不自動刪**：分不出是舊版加的、VPN 加的還是使用者手動加的，
+  「檢視 NRPT 規則」只會列出來並附上刪除指令。改 Add 那行時別把 `-Comment` 拿掉。
+
 * **`route delete 0.0.0.0 mask 0.0.0.0 <gw>` 會刪掉指向該閘道的「所有」預設路由**，
   包含 DHCP 原本發的那條。清完可能整台機器對外不通而畫面上看不出來，
   所以 `ClearAsync` 最後會用 `NetInfo.HasDefaultRoute()` 自我檢查並在日誌明講。
