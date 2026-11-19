@@ -16,6 +16,23 @@ internal sealed class RouteConfigException(string message) : Exception(message);
 
 internal readonly record struct RefreshOutcome(bool ExternalFound, bool InternalFound);
 
+/// <summary>一個 namespace 的「已設定」與「生效中」比對結果。</summary>
+internal enum NrptState
+{
+    /// <summary>已設定，DNS Client 也載入了同一組 DNS 伺服器。</summary>
+    Effective,
+    /// <summary>登錄檔裡有，DNS Client 還沒載入（或被群組原則的 NRPT 整組蓋掉）。</summary>
+    NotLoaded,
+    /// <summary>生效中，但不是本機設定的，多半來自群組原則或 DirectAccess。</summary>
+    NotLocal,
+    /// <summary>兩邊都有，但 DNS 伺服器不一樣 —— 改過設定、服務還沒重新載入。</summary>
+    Mismatch,
+}
+
+internal sealed record NrptEntry(string Namespace, List<string> Configured, List<string> Effective, NrptState State);
+
+internal sealed record NrptStatus(List<NrptEntry> Entries, List<string> Errors);
+
 internal static class RouteEngine
 {
     // ------------------------------------------------------------------
@@ -362,35 +379,88 @@ internal static class RouteEngine
 
     public static Task<string> RouteTableAsync() => ProcessRunner.RoutePrintAsync();
 
-    /// <summary>目前系統上實際生效的 NRPT 規則，用來核對設定有沒有真的套上去。</summary>
-    public static async Task<List<DomainRule>> NrptRulesAsync(CancellationToken ct = default)
+    /// <summary>
+    /// 把「已設定」和「生效中」的 NRPT 規則並排比對，用來核對設定有沒有真的套上去。
+    ///
+    /// 這是兩層不同的東西：<c>Get-DnsClientNrptRule</c> 讀的是登錄檔裡寫了什麼，
+    /// <c>Get-DnsClientNrptPolicy</c> 才是 DNS Client 服務（Dnscache）已經載入、真的在用的。
+    /// 規則一加就進登錄檔，但服務是自己找時機重新載入的，中間會有落差；
+    /// 另外只要群組原則下發了任何 NRPT，本機規則會整組被忽略。只看前者的話，
+    /// 「設了卻沒生效」這件事在畫面上完全看不出來 —— 而那正是使用者打開這個畫面要查的。
+    /// </summary>
+    public static async Task<NrptStatus> NrptStatusAsync(CancellationToken ct = default)
     {
         const string script = """
             [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-            Get-DnsClientNrptRule | ForEach-Object {
-              $ns = if ($_.Namespace) { ($_.Namespace -join ';') } else { '' }
-              $servers = if ($_.NameServers) { ($_.NameServers -join ',') } else { '' }
-              Write-Output "$ns|$servers"
+            try {
+              Get-DnsClientNrptRule -ErrorAction Stop | ForEach-Object {
+                $servers = @($_.NameServers) -join ','
+                foreach ($ns in @($_.Namespace)) { Write-Output "RULE|$ns|$servers" }
+              }
+            } catch {
+              Write-Output "ERR|讀取已設定的 NRPT 規則失敗: $($_.Exception.Message)"
+            }
+            try {
+              Get-DnsClientNrptPolicy -ErrorAction Stop | ForEach-Object {
+                $servers = @($_.NameServers) -join ','
+                foreach ($ns in @($_.Namespace)) { Write-Output "POLICY|$ns|$servers" }
+              }
+            } catch {
+              Write-Output "ERR|讀取生效中的 NRPT 原則失敗: $($_.Exception.Message)"
             }
             """;
 
         ExecResult r = await ProcessRunner.PowerShellAsync(script, null, ct).ConfigureAwait(false);
-        var rules = new List<DomainRule>();
-        if (!r.Ok) return rules;
+
+        var configured = new Dictionary<string, SortedSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var effective = new Dictionary<string, SortedSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var errors = new List<string>();
 
         foreach (string line in SplitLines(r.Output))
         {
-            int bar = line.IndexOf('|');
-            if (bar < 0) continue;
-            rules.Add(new DomainRule
+            string[] parts = line.Split('|', 3);
+            Dictionary<string, SortedSet<string>>? target = parts[0] switch
             {
-                Namespace = line[..bar],
-                DnsServers = line[(bar + 1)..]
-                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                    .ToList(),
-            });
+                "RULE" => configured,
+                "POLICY" => effective,
+                _ => null,
+            };
+
+            if (parts[0] == "ERR" && parts.Length > 1) { errors.Add(line[4..]); continue; }
+            if (target == null || parts.Length < 3 || parts[1].Length == 0)
+            {
+                if (!r.Ok) errors.Add(line);
+                continue;
+            }
+
+            if (!target.TryGetValue(parts[1], out SortedSet<string>? set))
+                target[parts[1]] = set = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string s in parts[2].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                set.Add(s);
         }
-        return rules;
+
+        if (!r.Ok && errors.Count == 0)
+            errors.Add(string.IsNullOrWhiteSpace(r.Output) ? "PowerShell 執行失敗" : r.Output.Trim());
+
+        var entries = configured.Keys
+            .Union(effective.Keys, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(ns => ns.TrimStart('.'), StringComparer.OrdinalIgnoreCase)
+            .Select(ns =>
+            {
+                configured.TryGetValue(ns, out SortedSet<string>? c);
+                effective.TryGetValue(ns, out SortedSet<string>? e);
+                NrptState state = (c, e) switch
+                {
+                    (not null, null) => NrptState.NotLoaded,
+                    (null, not null) => NrptState.NotLocal,
+                    _ when c!.SetEquals(e!) => NrptState.Effective,
+                    _ => NrptState.Mismatch,
+                };
+                return new NrptEntry(ns, c?.ToList() ?? [], e?.ToList() ?? [], state);
+            })
+            .ToList();
+
+        return new NrptStatus(entries, errors);
     }
 
     // ------------------------------------------------------------------

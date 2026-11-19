@@ -221,7 +221,7 @@ internal sealed class MainForm : Form
             _miAutoStart, _miRestore, _miRestoreRetry, _miWatch, _miMinimizeToTray));
         menu.Items.Add(new ToolStripMenuItem("工具(&T)", null,
             new ToolStripMenuItem("檢視路由表(&R)", null, async (_, _) => await ViewRouteTableAsync()),
-            new ToolStripMenuItem("檢視目前 NRPT 規則(&N)", null, async (_, _) => await ViewNrptAsync()),
+            new ToolStripMenuItem("檢視 NRPT 規則（已設定 vs 生效中）(&N)", null, async (_, _) => await ViewNrptAsync()),
             new ToolStripSeparator(),
             new ToolStripMenuItem("重新取得外網 IP（ipconfig /renew）(&E)", null, async (_, _) => await RenewExternalAsync()),
             new ToolStripSeparator(),
@@ -1067,17 +1067,41 @@ internal sealed class MainForm : Form
     private async Task ViewNrptAsync()
     {
         SetStatus("讀取 NRPT 規則…");
-        LogLine("───── 目前生效的 NRPT 規則 ─────", InfoColor);
+        LogLine("───── NRPT 規則（已設定 vs 生效中）─────", InfoColor);
 
-        List<DomainRule> rules = await RouteEngine.NrptRulesAsync();
-        if (rules.Count == 0)
-        {
+        NrptStatus status = await RouteEngine.NrptStatusAsync();
+        foreach (string err in status.Errors)
+            LogLine($"  ✗ {err}", ErrColor);
+
+        if (status.Entries.Count == 0 && status.Errors.Count == 0)
             LogLine("（目前沒有任何 NRPT 規則）", InfoColor);
-        }
-        else
+
+        static string Join(List<string> s) => s.Count == 0 ? "（無）" : string.Join(", ", s);
+
+        foreach (NrptEntry e in status.Entries)
         {
-            foreach (DomainRule r in rules)
-                LogLine($"  {r.Namespace} -> {string.Join(", ", r.DnsServers)}", Color.Black);
+            switch (e.State)
+            {
+                case NrptState.Effective:
+                    LogLine($"  ✓ {e.Namespace} -> {Join(e.Effective)}", OkColor);
+                    break;
+                case NrptState.NotLoaded:
+                    LogLine($"  ⚠ {e.Namespace} -> {Join(e.Configured)}　已設定，但尚未生效", WarnColor);
+                    break;
+                case NrptState.NotLocal:
+                    LogLine($"  ⚠ {e.Namespace} -> {Join(e.Effective)}　生效中，但不是本機設定的（可能來自群組原則）", WarnColor);
+                    break;
+                case NrptState.Mismatch:
+                    LogLine($"  ⚠ {e.Namespace}　已設定 {Join(e.Configured)}，生效中卻是 {Join(e.Effective)}", WarnColor);
+                    break;
+            }
+        }
+
+        if (status.Entries.Any(e => e.State is NrptState.NotLoaded or NrptState.Mismatch))
+        {
+            LogLine("  DNS Client 服務還沒重新載入設定，通常稍等一下再看一次就好。"
+                  + "一直沒生效的話，先拔插一次網路線；再不行，檢查是否有群組原則下發的 NRPT"
+                  + "（有的話本機規則會整組被忽略）。", InfoColor);
         }
         SetStatus("就緒");
     }
